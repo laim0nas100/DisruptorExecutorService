@@ -2,23 +2,19 @@ package com.github.laim0nas100;
 
 import com.lmax.disruptor.AlertException;
 import com.lmax.disruptor.BlockingWaitStrategy;
-import com.lmax.disruptor.BusySpinWaitStrategy;
 import com.lmax.disruptor.EventTranslatorOneArg;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.Sequence;
 import com.lmax.disruptor.SequenceBarrier;
 import com.lmax.disruptor.WaitStrategy;
-import com.lmax.disruptor.YieldingWaitStrategy;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
-import java.util.RandomAccess;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
@@ -107,12 +103,9 @@ public class DisruptorExecutorService implements ExecutorService {
                         sequence.set(available);
 
                         //don't end the thread just because of timeout or interrupt
-                    } catch (InterruptedException | com.lmax.disruptor.TimeoutException ignored) {
-                        barrier.checkAlert();
+                    } catch (AlertException | InterruptedException | com.lmax.disruptor.TimeoutException ignored) {
                     }
                 }
-            } catch (AlertException e) {
-                // Normal shutdown path
             } finally {
                 try {
 
@@ -169,7 +162,17 @@ public class DisruptorExecutorService implements ExecutorService {
     protected final Disruptor<TaskEvent> disruptor;
     protected final RingBuffer<TaskEvent> ringBuffer;
     protected final Sequence sharedGatingSequence = new Sequence();
-    public final int bufferLimitForPublishAttempt;
+    /**
+     * Padding to mitigate overlapping publishing and thread scheduling
+     * inconsistencies. Depends of the bufferSize, but clamped to [128;1024].
+     */
+    public final int bufferPublishPadding;
+    /**
+     * Used then executing batches via {@link DisruptorExecutorService#executeAll(java.util.Collection) },
+     * {@link ExecutorService##invokeAll(java.util.Collection) },
+     * {@link ExecutorService##invokeAll(java.util.Collection, long, java.util.concurrent.TimeUnit)}
+     * bufferSize - bufferPublishPadding
+     */
     public final int batchSize;
 
     //user workersLock when interacting with this set
@@ -193,8 +196,8 @@ public class DisruptorExecutorService implements ExecutorService {
         pool.setThreadsPrefix("DisruptorExeThread-");
         pool.setThreadsStarting(false);
         pool.setThreadsDeamon(true);
-        bufferLimitForPublishAttempt = Math.max(bufferSize / 512, 128);
-        batchSize = bufferSize - bufferLimitForPublishAttempt;
+        bufferPublishPadding = Math.min(Math.max(bufferSize / 512, 128), 1024);// clamp [128;1024]
+        batchSize = bufferSize - bufferPublishPadding;
         disruptor = new Disruptor<>(TaskEvent::new, bufferSize, pool, producer, strategy);
         ringBuffer = disruptor.getRingBuffer();
         ringBuffer.addGatingSequences(sharedGatingSequence);
@@ -333,7 +336,7 @@ public class DisruptorExecutorService implements ExecutorService {
         if (isShutdown()) {
             throw new IllegalStateException("Executor is shut down");
         }
-        if (ringBuffer.remainingCapacity() >= bufferLimitForPublishAttempt) {
+        if (ringBuffer.remainingCapacity() >= bufferPublishPadding) {
             ringBuffer.publishEvent(translator, command);
         } else {
             command.run();
@@ -382,30 +385,22 @@ public class DisruptorExecutorService implements ExecutorService {
         if (isShutdown()) {
             throw new IllegalStateException("Executor is shut down");
         }
-        
-        int allSize = all.size();
-        if (allSize <= batchSize) {
-            ringBuffer.publishEvents(translator, all.toArray(Runnable[]::new));
+
+        Runnable[] array = all.toArray(s -> new Runnable[s]);
+        if (array.length <= batchSize) {
+            ringBuffer.publishEvents(translator, array);
         } else {
-            List<Runnable> list;
-            if (all instanceof List && all instanceof RandomAccess) {
-                list = (List) all;
-            } else {
-                list = new ArrayList<>(all);
-            }
 
             int batch = 0;
             for (;;) {
                 int from = batch * batchSize;
-                int inc = Math.min(batchSize, allSize - from);
-                int to = from + inc;
-                int araySize = to - from;
-                batch++;
+                int inc = Math.min(batchSize, array.length - from);
 
-                Runnable[] array = new Runnable[araySize];
-                ringBuffer.publishEvents(translator, list.subList(from, to).toArray(array));
-                if (inc < batchSize || allSize <= to) {
-                    break;
+                if (inc > 0) {
+                    batch++;
+                    ringBuffer.publishEvents(translator, from, inc, array);
+                } else {
+                    return;
                 }
             }
         }
