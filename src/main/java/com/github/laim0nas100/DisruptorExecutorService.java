@@ -169,8 +169,8 @@ public class DisruptorExecutorService implements ExecutorService {
     protected final Disruptor<TaskEvent> disruptor;
     protected final RingBuffer<TaskEvent> ringBuffer;
     protected final Sequence sharedGatingSequence = new Sequence();
-    protected final int bufferLimitForPublishAttempt;
-    protected final int batchSize;
+    public final int bufferLimitForPublishAttempt;
+    public final int batchSize;
 
     //user workersLock when interacting with this set
     protected final Set<Worker> workers = new HashSet<>();
@@ -194,7 +194,7 @@ public class DisruptorExecutorService implements ExecutorService {
         pool.setThreadsStarting(false);
         pool.setThreadsDeamon(true);
         bufferLimitForPublishAttempt = Math.max(bufferSize / 512, 128);
-        batchSize = bufferSize / 4;
+        batchSize = bufferSize - bufferLimitForPublishAttempt;
         disruptor = new Disruptor<>(TaskEvent::new, bufferSize, pool, producer, strategy);
         ringBuffer = disruptor.getRingBuffer();
         ringBuffer.addGatingSequences(sharedGatingSequence);
@@ -382,8 +382,6 @@ public class DisruptorExecutorService implements ExecutorService {
         if (isShutdown()) {
             throw new IllegalStateException("Executor is shut down");
         }
-
-        int bufferSize = ringBuffer.getBufferSize();
         
         int allSize = all.size();
         if (allSize <= batchSize) {
