@@ -14,7 +14,7 @@ import java.util.stream.Stream;
 public class TrackedThreadPool extends ThreadGroup implements ThreadFactory {
 
     /**
-     * Empty subclass to differentiate threads from the same group created by
+     * Thread subclass to differentiate threads from the same group created by
      * this ThreadFactoryGroup
      */
     public static class TrackedThread extends Thread {
@@ -26,7 +26,6 @@ public class TrackedThreadPool extends ThreadGroup implements ThreadFactory {
             super(group, target, name);
             this.pool = Objects.requireNonNull(group);
             this.task = target;
-            pool.threadsCount.incrementAndGet();
         }
 
         public TrackedThread(TrackedThreadPool group, Runnable target, String name, boolean deamon, int priority, ClassLoader clLoader) {
@@ -38,7 +37,6 @@ public class TrackedThreadPool extends ThreadGroup implements ThreadFactory {
             if (clLoader != null) {
                 setContextClassLoader(clLoader);
             }
-            pool.threadsCount.incrementAndGet();
         }
 
         public Runnable getTask() {
@@ -51,12 +49,14 @@ public class TrackedThreadPool extends ThreadGroup implements ThreadFactory {
 
         @Override
         public void run() {
+            if (task == null) {//short lived, don't bother with counter
+                return;
+            }
             try {
-                if (task != null) {
-                    task.run();
-                }
+                pool.threadsAliveCount.incrementAndGet();
+                task.run();
             } finally {
-                pool.threadsCount.decrementAndGet();
+                pool.threadsAliveCount.decrementAndGet();
             }
         }
 
@@ -68,7 +68,7 @@ public class TrackedThreadPool extends ThreadGroup implements ThreadFactory {
     protected String threadsPrefix = "";
     protected String threadsSuffix = "";
     protected AtomicLong threadsNum = new AtomicLong(1L);
-    protected AtomicInteger threadsCount = new AtomicInteger(0);
+    protected AtomicInteger threadsAliveCount = new AtomicInteger(0);
     protected ClassLoader loader;
 
     public TrackedThreadPool(ThreadGroup parent, String name) {
@@ -135,21 +135,21 @@ public class TrackedThreadPool extends ThreadGroup implements ThreadFactory {
     }
 
     public Stream<Thread> enumerate(boolean recurse) {
-        int activeCount = recurse ? activeCount() : threadsCount.get();
+        int activeCount = recurse ? activeCount() : threadsAliveCount.get();
         int padding = Math.max(8, activeCount / 4);// ensure none are ignored
         Thread[] threads = new Thread[activeCount + padding];
         enumerate(threads, recurse);
-        return Stream.of(threads).filter(this::threadEnumerationFilter);
+        return Stream.of(threads).filter(t -> threadEnumerationFilter(recurse, t));
     }
 
     protected String nextThreadName() {
         return threadsPrefix + threadsNum.getAndIncrement() + threadsSuffix;
     }
 
-    protected boolean threadEnumerationFilter(Thread t) {
-        if (t != null && t instanceof TrackedThread) {
+    protected boolean threadEnumerationFilter(boolean recurse, Thread t) {
+        if (t instanceof TrackedThread) {
             TrackedThread st = (TrackedThread) t;
-            return st.pool == this;
+            return recurse || st.pool == this;
         }
         return false;
     }
