@@ -10,6 +10,7 @@ import com.lmax.disruptor.WaitStrategy;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -24,7 +25,6 @@ import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -33,6 +33,9 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
+ * {@link Disruptor} based {@link ExecutorService}. Threads don't grow
+ * automatically, so control it via {@link DisruptorExecutorService#ensurePoolSize(int)
+ * }.
  *
  * @author laim0nas100
  */
@@ -132,13 +135,13 @@ public class DisruptorExecutorService implements ExecutorService {
     protected final EventTranslatorOneArg<TaskEvent, Runnable> translator = new EventTranslatorOneArg<>() {
         @Override
         public void translateTo(TaskEvent event, long sequence, Runnable run) {
-            ExplicitFutureTask<?> task = event.getClearIfExplicit();
-            if (task != null) {
-                //potentionally overflowed slot. execute in place
-                task.run();
-            }
+            FutureTask<?> task = event.getClear();
             if (run != null) {
                 event.task = (FutureTask) newTaskFor(run, null);
+            }
+            if (task != null) {
+                //potentionally overflowed slot. execute in place if so
+                task.run();
             }
 
         }
@@ -168,14 +171,13 @@ public class DisruptorExecutorService implements ExecutorService {
      */
     public final int bufferPublishPadding;
     /**
-     * Used then executing batches via {@link DisruptorExecutorService#executeAll(java.util.Collection) },
-     * {@link ExecutorService##invokeAll(java.util.Collection) },
-     * {@link ExecutorService##invokeAll(java.util.Collection, long, java.util.concurrent.TimeUnit)}
+     * Used then executing batches via {@link DisruptorExecutorService#executeAll(java.lang.Runnable[])
+     * } or {@link ExecutorService##invokeAll(java.util.Collection) },
      * bufferSize - bufferPublishPadding
      */
     public final int batchSize;
 
-    //user workersLock when interacting with this set
+    //use workersLock when interacting with this set
     protected final Set<Worker> workers = new HashSet<>();
     protected final ReentrantLock workersLock = new ReentrantLock();
 
@@ -206,13 +208,19 @@ public class DisruptorExecutorService implements ExecutorService {
     }
 
     /**
-     * Can grow or shrink pool size. Setting to 0 effectively stops the workers
+     * Can grow or shrink pool size. Setting to 0 effectively stops the work
      * without shutting down the executor.
      *
      * @param poolSize desired pool size
      * @return the worker change, negative or positive
      */
     public int ensurePoolSize(int poolSize) {
+        if (isShutdown()) {
+            throw new IllegalStateException("Executor is shut down");
+        }
+        if (poolSize < 0) {
+            throw new IllegalArgumentException("Pool size is negative:" + poolSize);
+        }
         int grew = 0;
         try {
             workersLock.lock();
@@ -262,6 +270,7 @@ public class DisruptorExecutorService implements ExecutorService {
         }
         //poison pill shutdown
         disruptor.getRingBuffer().publishEvent((TaskEvent event, long sequence) -> {
+            FutureTask other = event.getClear();
             event.task = new FutureTask<>(() -> {
                 halted = true;
                 try {
@@ -275,6 +284,9 @@ public class DisruptorExecutorService implements ExecutorService {
 
                 return 0;
             });
+            if (other != null) {
+                other.run();
+            }
         });
 
     }
@@ -381,35 +393,40 @@ public class DisruptorExecutorService implements ExecutorService {
         return t;
     }
 
-    public void executeAll(Collection<Runnable> all) {
+    /**
+     * Delegates to
+     * {@link DisruptorExecutorService#executeAll(java.lang.Runnable[], int, int) }
+     * with starting index of 0 and ending index of array length.
+     *
+     * @param array
+     */
+    public void executeAll(Runnable[] array) {
+        executeAll(array, 0, array.length);
+    }
+
+    /**
+     * Executes all {@link Runnable} in a given array. If the array is bigger
+     * than {@link DisruptorExecutorService#batchSize}, then it is submitted by
+     * batches.
+     *
+     * @param array array of runnables
+     * @param from starting index (inclusive)
+     * @param to ending index (exclusive)
+     */
+    public void executeAll(Runnable[] array, int from, int to) {
         if (isShutdown()) {
             throw new IllegalStateException("Executor is shut down");
         }
 
-        Runnable[] array = all.toArray(s -> new Runnable[s]);
-        if (array.length <= batchSize) {
-            ringBuffer.publishEvents(translator, array);
-        } else {
-
-            int batch = 0;
-            for (;;) {
-                int from = batch * batchSize;
-                int inc = Math.min(batchSize, array.length - from);
-
-                if (inc > 0) {
-                    batch++;
-                    ringBuffer.publishEvents(translator, from, inc, array);
-                } else {
-                    return;
-                }
-            }
+        for (; from < to; from += batchSize) {
+            ringBuffer.publishEvents(translator, from, Math.min(batchSize, to - from), array);
         }
     }
 
     /**
      * the main mechanics of invokeAny.
      */
-    private <T> T doInvokeAny(Collection<? extends Callable<T>> tasks,
+    protected <T> T doInvokeAny(Collection<? extends Callable<T>> tasks,
             boolean timed, long nanos)
             throws InterruptedException, ExecutionException, TimeoutException {
         if (tasks == null) {
@@ -481,13 +498,6 @@ public class DisruptorExecutorService implements ExecutorService {
         }
     }
 
-    /**
-     * @throws InterruptedException {@inheritDoc}
-     * @throws NullPointerException {@inheritDoc}
-     * @throws IllegalArgumentException {@inheritDoc}
-     * @throws ExecutionException {@inheritDoc}
-     * @throws RejectedExecutionException {@inheritDoc}
-     */
     @Override
     public <T> T invokeAny(Collection<? extends Callable<T>> tasks)
             throws InterruptedException, ExecutionException {
@@ -499,13 +509,6 @@ public class DisruptorExecutorService implements ExecutorService {
         }
     }
 
-    /**
-     * @throws InterruptedException {@inheritDoc}
-     * @throws NullPointerException {@inheritDoc}
-     * @throws TimeoutException {@inheritDoc}
-     * @throws ExecutionException {@inheritDoc}
-     * @throws RejectedExecutionException {@inheritDoc}
-     */
     @Override
     public <T> T invokeAny(Collection<? extends Callable<T>> tasks,
             long timeout, TimeUnit unit)
@@ -513,45 +516,30 @@ public class DisruptorExecutorService implements ExecutorService {
         return doInvokeAny(tasks, true, unit.toNanos(timeout));
     }
 
-    /**
-     * @throws InterruptedException {@inheritDoc}
-     * @throws NullPointerException {@inheritDoc}
-     * @throws RejectedExecutionException {@inheritDoc}
-     */
     @Override
     public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks)
             throws InterruptedException {
         if (tasks == null) {
             throw new NullPointerException();
         }
-        ArrayList<RunnableFuture<T>> futures = new ArrayList<>(tasks.size());
+        RunnableFuture<T>[] futures = tasks.stream().map(this::newTaskFor).toArray(s -> new RunnableFuture[s]);
         try {
-            for (Callable<T> t : tasks) {
-                RunnableFuture<T> f = newTaskFor(t);
-                futures.add(f);
-            }
-            executeAll((Collection) futures);
-            for (int i = 0, size = futures.size(); i < size; i++) {
-                Future<T> f = futures.get(i);
-                if (!f.isDone()) {
+            executeAll(futures);
+            for (RunnableFuture<T> future : futures) {
+                if (!future.isDone()) {
                     try {
-                        f.get();
+                        future.get();
                     } catch (CancellationException | ExecutionException ignore) {
                     }
                 }
             }
-            return (List) futures;
+            return Arrays.asList(futures);
         } catch (Throwable t) {
-            cancelAll((ArrayList) futures);
+            cancelAll(Arrays.asList(futures));
             throw t;
         }
     }
 
-    /**
-     * @throws InterruptedException {@inheritDoc}
-     * @throws NullPointerException {@inheritDoc}
-     * @throws RejectedExecutionException {@inheritDoc}
-     */
     @Override
     public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks,
             long timeout, TimeUnit unit)
@@ -561,20 +549,15 @@ public class DisruptorExecutorService implements ExecutorService {
         }
         final long nanos = unit.toNanos(timeout);
         final long deadline = System.nanoTime() + nanos;
-        ArrayList<Future<T>> futures = new ArrayList<>(tasks.size());
+        RunnableFuture<T>[] futures = tasks.stream().map(this::newTaskFor).toArray(s -> new RunnableFuture[s]);
         int j = 0;
         timedOut:
         try {
-            for (Callable<T> t : tasks) {
-                futures.add(newTaskFor(t));
-            }
 
-            final int size = futures.size();
+            executeAll(futures);
 
-            executeAll((List) futures);
-
-            for (; j < size; j++) {
-                Future<T> f = futures.get(j);
+            for (; j < futures.length; j++) {
+                Future<T> f = futures[j];
                 if (!f.isDone()) {
                     try {
                         f.get(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
@@ -584,16 +567,19 @@ public class DisruptorExecutorService implements ExecutorService {
                     }
                 }
             }
-            return futures;
+            return Arrays.asList(futures);
         } catch (Throwable t) {
-            cancelAll(futures);
+            cancelAll(Arrays.asList(futures));
             throw t;
         }
         // Timed out before all the tasks could be completed; cancel remaining
-        cancelAll(futures, j);
-        return futures;
+        cancelAll(Arrays.asList(futures), j);
+        return Arrays.asList(futures);
     }
 
+    /**
+     * Cancels all futures.
+     */
     protected <T> void cancelAll(List<Future<T>> futures) {
         cancelAll(futures, 0);
     }
