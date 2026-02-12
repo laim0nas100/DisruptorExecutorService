@@ -1,7 +1,7 @@
 package tests;
 
 import com.github.laim0nas100.DisruptorExecutorService;
-import com.github.laim0nas100.ExplicitFutureTask;
+import com.github.laim0nas100.DisruptorExecutorService.Task;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -20,7 +20,7 @@ public class Main {
 //        ExecutorService service = Executors.newFixedThreadPool(10);
 
         int size = 10000000;
-        boolean bunch = true;
+        boolean bunch = false;
         boolean shutdownNow = false;
 
         AtomicInteger atomic = new AtomicInteger(0);
@@ -58,7 +58,7 @@ public class Main {
         if (shutdownNow) {
             List<Runnable> leftRunnables = service.shutdownNow();
             service.awaitTermination(1, TimeUnit.DAYS);
-            System.out.println(atomic.get() + leftRunnables.stream().map(m -> (ExplicitFutureTask) m).filter(f -> f.isNew()).count());
+            System.out.println(atomic.get() + leftRunnables.stream().map(m -> (Task) m).filter(f -> f.isNew()).count());
         } else {
             service.shutdown();
             service.awaitTermination(1, TimeUnit.DAYS);

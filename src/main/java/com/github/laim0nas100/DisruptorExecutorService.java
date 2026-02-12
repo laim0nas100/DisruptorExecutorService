@@ -26,6 +26,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.RunnableFuture;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -41,14 +42,45 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class DisruptorExecutorService implements ExecutorService {
 
+    public static class Task<T> extends FutureTask<T> {
+        //FutureTask deesn't expose the state variable. the state() method is also insufficient
+
+        protected final AtomicBoolean NEW = new AtomicBoolean(true);
+
+        public Task(Callable<T> callable) {
+            super(callable);
+        }
+
+        public Task(Runnable runnable, T result) {
+            super(runnable, result);
+        }
+
+        @Override
+        public void setException(Throwable t) {
+            super.setException(t);
+        }
+
+        @Override
+        public void run() {
+            if (NEW.compareAndSet(true, false)) {
+                super.run();
+            }
+
+        }
+
+        public boolean isNew() {
+            return NEW.get();
+        }
+    }
+
     public static final class TaskEvent {
 
         public FutureTask<?> task;
 
-        public ExplicitFutureTask getClearIfExplicit() {
+        public Task getClearIfExplicit() {
             FutureTask t = task;
-            if (t instanceof ExplicitFutureTask) {
-                ExplicitFutureTask r = (ExplicitFutureTask) t;
+            if (t instanceof Task) {
+                Task r = (Task) t;
                 task = null;
                 return r;
             }
@@ -153,6 +185,12 @@ public class DisruptorExecutorService implements ExecutorService {
     public static final int DEFAULT_BUFFER_SIZE = 65536;
     public static final ProducerType DEFAULT_PRODUCER_TYPE = ProducerType.SINGLE;
     public static final WaitStrategy DEFAULT_WAIT_STRATEGY = new BlockingWaitStrategy();
+    public static final ThreadFactory DEFAULT_THREAD_FACTORY = runnable -> {
+        Thread thread = new Thread(runnable);
+        thread.setDaemon(true);
+        thread.setName("DisruptorExeThread-" + thread.getId());
+        return thread;
+    };
 
     public static final int MIN_BUFFER_SIZE = 512;
 
@@ -161,7 +199,7 @@ public class DisruptorExecutorService implements ExecutorService {
 
     protected final CompletableFuture awaitFuture = new CompletableFuture();
 
-    protected final TrackedThreadPool pool;
+    protected final ThreadFactory threadFactory;
     protected final Disruptor<TaskEvent> disruptor;
     protected final RingBuffer<TaskEvent> ringBuffer;
     protected final Sequence sharedGatingSequence = new Sequence();
@@ -186,21 +224,18 @@ public class DisruptorExecutorService implements ExecutorService {
     }
 
     public DisruptorExecutorService(int bufferSize) {
-        this(bufferSize, DEFAULT_PRODUCER_TYPE, DEFAULT_WAIT_STRATEGY);
+        this(bufferSize, DEFAULT_PRODUCER_TYPE, DEFAULT_WAIT_STRATEGY, DEFAULT_THREAD_FACTORY);
     }
 
-    public DisruptorExecutorService(int bufferSize, ProducerType producer, WaitStrategy strategy) {
+    public DisruptorExecutorService(int bufferSize, ProducerType producer, WaitStrategy strategy, ThreadFactory factory) {
 
         if (bufferSize < MIN_BUFFER_SIZE || (bufferSize != Integer.highestOneBit(bufferSize))) {
             throw new IllegalArgumentException("buffer size must be at least " + bufferSize + " and a power of 2");
         }
-        pool = new TrackedThreadPool("DisruptorExe");
-        pool.setThreadsPrefix("DisruptorExeThread-");
-        pool.setThreadsStarting(false);
-        pool.setThreadsDeamon(true);
+        this.threadFactory = Objects.requireNonNull(factory);
         bufferPublishPadding = Math.min(Math.max(bufferSize / 512, 128), 1024);// clamp [128;1024]
         batchSize = bufferSize - bufferPublishPadding;
-        disruptor = new Disruptor<>(TaskEvent::new, bufferSize, pool, producer, strategy);
+        disruptor = new Disruptor<>(TaskEvent::new, bufferSize, factory, producer, strategy);
         ringBuffer = disruptor.getRingBuffer();
         ringBuffer.addGatingSequences(sharedGatingSequence);
         disruptor.start();
@@ -242,7 +277,8 @@ public class DisruptorExecutorService implements ExecutorService {
             for (int i = size; i < poolSize; i++) {
                 Worker worker = new Worker(this);
                 workers.add(worker);
-                pool.newThread(worker).start();
+                Thread thread = threadFactory.newThread(worker);
+                thread.start();
                 grew++;
             }
             return grew;
@@ -263,10 +299,15 @@ public class DisruptorExecutorService implements ExecutorService {
             throw new IllegalStateException("Executor was already shut down");
         }
 
-        if (pool.activeCount() == 0) {
-            halted = true;
-            awaitFuture.complete(0);
-            return;
+        workersLock.lock();
+        try {
+            if (workers.isEmpty()) {
+                halted = true;
+                awaitFuture.complete(0);
+                return;
+            }
+        } finally {
+            workersLock.unlock();
         }
         //poison pill shutdown
         disruptor.getRingBuffer().publishEvent((TaskEvent event, long sequence) -> {
@@ -308,19 +349,23 @@ public class DisruptorExecutorService implements ExecutorService {
             if (get == null || get.task == null) {
                 continue;
             }
-            ExplicitFutureTask task = get.getClearIfExplicit();
+            Task task = get.getClearIfExplicit();
             if (task != null && task.isNew()) {
                 left.add(task);
             }
         }
-        if (pool.activeCount() == 0) {
-            awaitFuture.complete(0);
-            return left;
-        }
         try {
             workersLock.lock();
+            if (workers.isEmpty()) {
+                halted = true;
+                awaitFuture.complete(0);
+                return left;
+            }
             workers.forEach(worker -> {
                 worker.barrier.alert();
+                if (worker.runner != null) {
+                    worker.runner.interrupt();
+                }
             });
         } finally {
             workersLock.unlock();
@@ -356,39 +401,39 @@ public class DisruptorExecutorService implements ExecutorService {
 
     }
 
-    protected <T> ExplicitFutureTask<T> newTaskFor(Callable<T> task) {
-        if (task instanceof ExplicitFutureTask) {
-            return (ExplicitFutureTask) task;
+    protected <T> Task<T> newTaskFor(Callable<T> task) {
+        if (task instanceof Task) {
+            return (Task) task;
         } else {
-            return new ExplicitFutureTask<>(task);
+            return new Task<>(task);
         }
     }
 
-    protected <T> ExplicitFutureTask<T> newTaskFor(Runnable task, T res) {
-        if (task instanceof ExplicitFutureTask) {
-            return (ExplicitFutureTask) task;
+    protected <T> Task<T> newTaskFor(Runnable task, T res) {
+        if (task instanceof Task) {
+            return (Task) task;
         } else {
-            return new ExplicitFutureTask<>(task, res);
+            return new Task<>(task, res);
         }
     }
 
     @Override
     public <T> Future<T> submit(Callable<T> task) {
-        ExplicitFutureTask<T> t = newTaskFor(task);
+        Task<T> t = newTaskFor(task);
         execute(t);
         return t;
     }
 
     @Override
     public <T> Future<T> submit(Runnable task, T result) {
-        ExplicitFutureTask<T> t = newTaskFor(task, result);
+        Task<T> t = newTaskFor(task, result);
         execute(t);
         return t;
     }
 
     @Override
     public Future<?> submit(Runnable task) {
-        ExplicitFutureTask<?> t = newTaskFor(task, null);
+        Task<?> t = newTaskFor(task, null);
         execute(t);
         return t;
     }
