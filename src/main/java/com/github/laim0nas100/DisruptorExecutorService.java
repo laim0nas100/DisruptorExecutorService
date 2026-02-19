@@ -230,7 +230,7 @@ public class DisruptorExecutorService implements ExecutorService {
     public DisruptorExecutorService(int bufferSize, ProducerType producer, WaitStrategy strategy, ThreadFactory factory) {
 
         if (bufferSize < MIN_BUFFER_SIZE || (bufferSize != Integer.highestOneBit(bufferSize))) {
-            throw new IllegalArgumentException("buffer size must be at least " + bufferSize + " and a power of 2");
+            throw new IllegalArgumentException("buffer size must be at least " + MIN_BUFFER_SIZE + " and a power of 2");
         }
         this.threadFactory = Objects.requireNonNull(factory);
         bufferPublishPadding = Math.min(Math.max(bufferSize / 512, 128), 1024);// clamp [128;1024]
