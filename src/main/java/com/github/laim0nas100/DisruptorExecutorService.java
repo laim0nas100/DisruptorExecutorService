@@ -42,6 +42,11 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class DisruptorExecutorService implements ExecutorService {
 
+    /**
+     * Basic FutureTask implementation, with NEW state exposed.
+     *
+     * @param <T>
+     */
     public static class Task<T> extends FutureTask<T> {
         //FutureTask deesn't expose the state variable. the state() method is also insufficient
 
@@ -57,7 +62,9 @@ public class DisruptorExecutorService implements ExecutorService {
 
         @Override
         public void setException(Throwable t) {
-            super.setException(t);
+            if (NEW.compareAndSet(true, false)) {
+                super.setException(t);
+            }
         }
 
         @Override
@@ -65,9 +72,14 @@ public class DisruptorExecutorService implements ExecutorService {
             if (NEW.compareAndSet(true, false)) {
                 super.run();
             }
-
         }
 
+        /**
+         * If the run method was called or not. Doesn't work with
+         * {@link runAndReset}
+         *
+         * @return
+         */
         public boolean isNew() {
             return NEW.get();
         }
@@ -123,10 +135,7 @@ public class DisruptorExecutorService implements ExecutorService {
 
                             // Claim this slot - only one worker wins
                             if (service.sharedGatingSequence.compareAndSet(seq - 1, seq)) {
-                                FutureTask task = event.getClear();
-                                if (task != null) {
-                                    task.run();
-                                }
+                                safeRun(event.getClear());
                                 seq++;
                             } else {
                                 LockSupport.parkNanos(1);//CAS contention backoff 
@@ -164,6 +173,20 @@ public class DisruptorExecutorService implements ExecutorService {
 
     }
 
+    /**
+     * Run optionally null-able runnable that ignores exceptions.
+     *
+     * @param run
+     */
+    public static void safeRun(Runnable run) {
+        if (run != null) {
+            try {
+                run.run();
+            } catch (Throwable ignore) {
+            }
+        }
+    }
+
     protected final EventTranslatorOneArg<TaskEvent, Runnable> translator = new EventTranslatorOneArg<>() {
         @Override
         public void translateTo(TaskEvent event, long sequence, Runnable run) {
@@ -171,11 +194,8 @@ public class DisruptorExecutorService implements ExecutorService {
             if (run != null) {
                 event.task = (FutureTask) newTaskFor(run, null);
             }
-            if (task != null) {
-                //potentionally overflowed slot. execute in place if so
-                task.run();
-            }
-
+            //potentionally overflowed slot. execute in place if so. Should never happen with correct worker implementation
+            safeRun(task);
         }
     };
 
@@ -293,6 +313,30 @@ public class DisruptorExecutorService implements ExecutorService {
         return !open.get();
     }
 
+    protected void poisonPillShutdown() {
+
+        disruptor.getRingBuffer().publishEvent((TaskEvent event, long sequence) -> {
+            FutureTask other = event.getClear();
+            event.task = new FutureTask<>(() -> { //different type than Task
+                halted = true;
+                try {
+                    workersLock.lock();
+                    workers.forEach(worker -> {
+                        worker.barrier.alert();
+                        if (worker.runner != null && worker.runner.isAlive()) {
+                            worker.runner.interrupt();
+                        }
+                    });
+                } finally {
+                    workersLock.unlock();
+                }
+
+                return 0;
+            });
+            safeRun(other);
+        });
+    }
+
     @Override
     public void shutdown() {//gracefull shutdown
         if (!open.compareAndSet(true, false)) {
@@ -309,38 +353,22 @@ public class DisruptorExecutorService implements ExecutorService {
         } finally {
             workersLock.unlock();
         }
-        //poison pill shutdown
-        disruptor.getRingBuffer().publishEvent((TaskEvent event, long sequence) -> {
-            FutureTask other = event.getClear();
-            event.task = new FutureTask<>(() -> {
-                halted = true;
-                try {
-                    workersLock.lock();
-                    workers.forEach(worker -> {
-                        worker.barrier.alert();
-                    });
-                } finally {
-                    workersLock.unlock();
-                }
 
-                return 0;
-            });
-            if (other != null) {
-                other.run();
-            }
-        });
+        poisonPillShutdown();
 
     }
 
+    /**
+     * {@inheritDoc} Lastly cast the {@link Runnable} to {@link Task} and filter
+     * unexecuted by {@link Task#isNew }
+     */
     @Override
     public List<Runnable> shutdownNow() {//abrupt shutdown
         if (!open.compareAndSet(true, false)) {
             throw new IllegalStateException("Executor was already shut down");
         }
-        halted = true;
 
         List<Runnable> left = new ArrayList<>();
-
         long size = ringBuffer.getBufferSize();
         //don't care about already finished, just skip it. The idea is to scan the whole buffer
         long offset = ringBuffer.getMinimumGatingSequence();
@@ -361,15 +389,10 @@ public class DisruptorExecutorService implements ExecutorService {
                 awaitFuture.complete(0);
                 return left;
             }
-            workers.forEach(worker -> {
-                worker.barrier.alert();
-                if (worker.runner != null) {
-                    worker.runner.interrupt();
-                }
-            });
         } finally {
             workersLock.unlock();
         }
+        poisonPillShutdown();
         return left;
     }
 
@@ -393,10 +416,12 @@ public class DisruptorExecutorService implements ExecutorService {
         if (isShutdown()) {
             throw new IllegalStateException("Executor is shut down");
         }
+
+        //while tryPublishEvent, some events are not submitted. In practice overflowing the ringBuffer should be rare. If that's happening - increase the size.
         if (ringBuffer.remainingCapacity() >= bufferPublishPadding) {
             ringBuffer.publishEvent(translator, command);
         } else {
-            command.run();
+            safeRun(command);
         }
 
     }
@@ -469,7 +494,7 @@ public class DisruptorExecutorService implements ExecutorService {
     }
 
     /**
-     * the main mechanics of invokeAny.
+     * the main mechanics of invokeAny. Copy-paste.
      */
     protected <T> T doInvokeAny(Collection<? extends Callable<T>> tasks,
             boolean timed, long nanos)
